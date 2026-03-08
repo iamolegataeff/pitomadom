@@ -108,21 +108,135 @@ class RealSchumannData:
             self._load_data()
 
     def _load_data(self) -> None:
-        """Load actual NPZ data files."""
+        """
+        Load actual NPZ data files from Sierra Nevada ELF station.
+
+        Source: https://digibug.ugr.es/handle/10481/71563
+        Download: wget 'https://digibug.ugr.es/bitstream/handle/10481/71563/Npz.zip?sequence=1&isAllowed=y'
+        Then: unzip Npz.zip -d schumann_data/
+
+        File naming: SN_YYMM_LO_6_1_{0,1}.npz (two channels per month)
+        Period: March 2013 (1303) — February 2017 (1702), 96 files total.
+
+        NPZ structure (verified from actual data):
+          arr_0: (N,)       — fractional day timestamps
+          arr_1: (F0,)      — frequency axis channel 0 (6-25 Hz)
+          arr_2: (F1,)      — frequency axis channel 1
+          arr_3: (N, F0)    — power spectra channel 0
+          arr_4: (N, F1)    — power spectra channel 1
+          arr_5: (N, 14)    — Lorentzian fit (6 amps, 3 freqs, 3 widths, 2 baseline)
+          arr_6: (N,)       — total power / RMS
+          arr_7: (N, 11)    — quality flags (contains NaN)
+          arr_8: (N, 6)     — compact: [amp1, freq1, amp2, freq2, amp3, freq3]
+
+        arr_8 is the cleanest: alternating amplitude and frequency for 3 SR modes.
+        Typical values: [0.33, 7.51, 0.25, 14.19, 0.22, 20.43]
+        """
         if not self.data_path:
             return
 
-        # NPZ files contain: amplitudes, frequencies, widths, power spectrum
-        # for first 3 SR modes at 10-minute intervals
         try:
-            npz_files = list(self.data_path.glob("*.npz"))
+            # Look for NPZ files in data_path or data_path/Npz/
+            npz_files = sorted(self.data_path.glob("*.npz"))
+            if not npz_files:
+                npz_subdir = self.data_path / "Npz"
+                if npz_subdir.exists():
+                    npz_files = sorted(npz_subdir.glob("*.npz"))
+
+            if not npz_files:
+                print(f"Warning: No NPZ files found in {self.data_path}")
+                return
+
+            total_measurements = 0
             for npz_file in npz_files:
-                data = np.load(npz_file)
-                # Process and store measurements
-                # Actual structure depends on the specific file format
+                data = np.load(npz_file, allow_pickle=True)
+
+                # Extract year/month from filename: SN_YYMM_...
+                stem = npz_file.stem  # e.g., "SN_1303_LO_6_1_0"
+                parts = stem.split('_')
+                try:
+                    yymm = parts[1]  # "1303"
+                    year = 2000 + int(yymm[:2])  # 2013
+                    month = int(yymm[2:])         # 3
+                except (IndexError, ValueError):
+                    continue
+
+                # Use arr_8: compact [amp1, freq1, amp2, freq2, amp3, freq3]
+                if 'arr_8' not in data:
+                    continue
+
+                compact = data['arr_8']  # (N, 6)
+                timestamps = data['arr_0'] if 'arr_0' in data else None  # (N,) fractional days
+                n_samples = compact.shape[0]
+
+                # Also get Lorentzian widths from arr_5 if available
+                fit_params = data['arr_5'] if 'arr_5' in data else None
+
+                for i in range(n_samples):
+                    row = compact[i]
+                    amp1, freq1 = row[0], row[1]
+                    amp2, freq2 = row[2], row[3]
+                    amp3, freq3 = row[4], row[5]
+
+                    # Sanity check: fundamental should be 6-10 Hz
+                    if not (5.0 < freq1 < 12.0):
+                        continue
+
+                    # Build timestamp
+                    if timestamps is not None:
+                        # Fractional day within month
+                        frac_day = timestamps[i]
+                        day = max(1, min(28, int(frac_day * 28) + 1))
+                        total_minutes = int(frac_day * 28 * 24 * 60) if frac_day > 0 else i * 10
+                    else:
+                        total_minutes = i * 10
+                        day = 1 + total_minutes // (24 * 60)
+
+                    hour = (total_minutes // 60) % 24
+                    minute = total_minutes % 60
+                    day = max(1, min(28, day))
+
+                    try:
+                        dt = datetime(year, month, day, hour, minute)
+                    except ValueError:
+                        continue
+
+                    # Width from Lorentzian fit (col 9,10,11 in arr_5)
+                    if fit_params is not None and fit_params.shape[1] >= 12:
+                        w1 = abs(fit_params[i, 9])
+                    else:
+                        w1 = 0.5  # typical
+
+                    q_factor = freq1 / max(w1, 0.01)
+
+                    measurement = SchumannMeasurement(
+                        timestamp=dt,
+                        fundamental_freq=round(freq1, 3),
+                        fundamental_amplitude=round(abs(amp1), 3),
+                        harmonic_freqs=[round(freq2, 3), round(freq3, 3)],
+                        harmonic_amplitudes=[round(abs(amp2), 3), round(abs(amp3), 3)],
+                        power_spectral_density=round(amp1 ** 2 / max(freq1, 0.01), 4),
+                        quality_factor=round(q_factor, 2),
+                    )
+
+                    d = dt.date()
+                    if d not in self._measurements:
+                        self._measurements[d] = []
+                    self._measurements[d].append(measurement)
+                    total_measurements += 1
+
+            if total_measurements > 0:
                 self._data_loaded = True
+                print(f"Loaded {total_measurements} real Schumann measurements "
+                      f"across {len(self._measurements)} days "
+                      f"from {len(npz_files)} files")
+            else:
+                print("Warning: NPZ files found but no valid measurements parsed.")
+
         except Exception as e:
             print(f"Warning: Could not load Schumann data: {e}")
+            import traceback
+            traceback.print_exc()
 
     def get_measurement(self, dt: datetime) -> SchumannMeasurement:
         """
@@ -144,7 +258,14 @@ class RealSchumannData:
 
     def _approximate_measurement(self, dt: datetime) -> SchumannMeasurement:
         """
-        Generate measurement based on published diurnal patterns.
+        FALLBACK: Synthetic approximation when real data is not loaded.
+
+        Based on published diurnal/seasonal patterns from:
+        Fernandez et al. (2022), Computers & Geosciences.
+
+        To use REAL data instead, download from:
+        https://digibug.ugr.es/bitstream/handle/10481/71563/Npz.zip
+        and pass data_path to RealSchumannData constructor.
 
         Schumann resonance shows:
         - Diurnal variation (higher during local thunderstorm maxima)
